@@ -1,0 +1,267 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <BluetoothSerial.h> 
+
+// =====================================================
+// 1. CONFIGURACIÓN DE PINES Y CONSTANTES
+// Explicación: Usamos 'const int' y 'const float' en lugar de '#define'. 
+// Esto asegura el "tipado fuerte" (el compilador sabe exactamente qué tipo de dato es)
+// y facilita la depuración de errores.
+// =====================================================
+const int SDA_PIN = 21; 
+const int SCL_PIN = 22;
+const int BUZZER_PIN = 25; 
+const int BUTTON_PIN = 18;
+const int LED_PIN = 19;      // LED indicador añadido
+
+const int FREC_ALTA = 3100;  // Frecuencia en Hz para tono agudo de sirena
+const int FREC_BAJA = 2300;  // Frecuencia en Hz para tono grave de sirena
+
+const float UMBRAL_CAIDA_LIBRE = 0.50;   // Límite en 'g' para detectar ingravidez (caída)
+const float UMBRAL_IMPACTO = 2.50;       // Límite en 'g' para confirmar un golpe brusco
+
+const unsigned long TIEMPO_CONFIRMACION = 15000;   // 15 seg de tiempo para cancelar alarma
+const unsigned long TIEMPO_PULSACION_LARGA = 2000; // 2 seg para considerar que es "botón de pánico"
+const unsigned long INTERVALO_ENVIO = 200;         // Envío de datos cada 200 ms
+
+// =====================================================
+// 2. OBJETOS Y MÁQUINA DE ESTADOS
+// =====================================================
+Adafruit_MPU6050 mpu;
+BluetoothSerial SerialBT;
+
+// Explicación: 'enum' define los estados únicos en los que puede estar nuestro sistema.
+// La máquina de estados asegura que el ESP32 solo pueda estar en UN estado a la vez.
+enum EstadoSistema {  
+  NORMAL,           // Reposo: monitoreando si hay caída libre
+  POSIBLE_CAIDA,    // Transición: detectó caída libre, esperando a ver si hay impacto
+  ALARMA            // Emergencia: sonando y contando el tiempo para confirmar
+};
+
+// Variable que almacena el estado actual de la máquina
+EstadoSistema estadoActual = NORMAL;
+
+// =====================================================
+// 3. VARIABLES GLOBALES DE CONTROL
+// =====================================================
+unsigned long inicioAlarma = 0; 
+unsigned long inicioBoton = 0;
+unsigned long ultimoEnvio = 0;
+unsigned long tiempoInicioCaida = 0; // Para medir la ventana entre caída e impacto
+
+bool botonPresionado = false; 
+bool alarmaManual = false;
+float aceleracionTotal = 0.0; 
+
+// Prototipos
+void maquinaDeEstados();
+void manejarBoton();
+void atenderComandosBluetooth();
+void enviarYMostrarDatos(float ax, float ay, float az);
+void activarAlarma(bool manual);
+void cancelarAlarma();
+
+// =====================================================
+// 4. CONFIGURACIÓN INICIAL (SETUP)
+// Explicación: Se ejecuta una sola vez al encender. Configura el hardware.
+// =====================================================
+void setup() {  
+  Serial.begin(115200);  
+  SerialBT.begin("ESP32_Anticaidas"); // Nombre del Bluetooth visible
+  
+  pinMode(BUZZER_PIN, OUTPUT);  
+  pinMode(BUTTON_PIN, INPUT_PULLUP); // Resistencia pull-up interna para el botón
+  pinMode(LED_PIN, OUTPUT);
+    
+  // Apagar actuadores al inicio
+  noTone(BUZZER_PIN);  
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Intentar conectar con el acelerómetro
+  if (!mpu.begin()) {  
+    Serial.println("ERROR: No se encontró el MPU6050.");  
+    while (true) { delay(10); } // Bucle infinito si falla el hardware
+  }
+
+  // Sensibilidad del acelerómetro (8G para impactos moderados)
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);  
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);  
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+}
+
+// =====================================================
+// 5. BUCLE PRINCIPAL (LOOP)
+// Explicación: Se ejecuta cíclicamente de forma infinita.
+// =====================================================
+void loop() {  
+  sensors_event_t aceleracion, giro, temperatura;
+  mpu.getEvent(&aceleracion, &giro, &temperatura);
+
+  // Leer y convertir de m/s^2 a fuerza 'g'
+  float ax = aceleracion.acceleration.x / 9.81;  
+  float ay = aceleracion.acceleration.y / 9.81;  
+  float az = aceleracion.acceleration.z / 9.81;
+
+  // Magnitud vectorial
+  aceleracionTotal = sqrt(ax * ax + ay * ay + az * az);
+
+  manejarBoton();              // Leer pulsaciones físicas
+  atenderComandosBluetooth();  // Escuchar a la app
+
+  // Ejecutar la máquina de estados según el estado actual
+  maquinaDeEstados();
+
+  // Enviar y mostrar datos respetando el intervalo no bloqueante
+  if (millis() - ultimoEnvio > INTERVALO_ENVIO) {
+    ultimoEnvio = millis();
+    enviarYMostrarDatos(ax, ay, az);
+  }
+
+  delay(20); 
+}
+
+// =====================================================
+// 6. MÁQUINA DE ESTADOS (SWITCH - CASE)
+// Explicación: Estructura central. Evalúa en qué estado estamos (switch) y 
+// decide qué hacer o a qué otro estado cambiar basándose en las lecturas.
+// =====================================================
+void maquinaDeEstados() {
+  switch (estadoActual) {
+    
+    // ------------------------------------
+    // ESTADO 1: Operación normal, buscando caídas
+    // ------------------------------------
+    case NORMAL:
+      if (aceleracionTotal < UMBRAL_CAIDA_LIBRE) {
+        // Transición: Detectamos ingravidez, pasamos al estado de posible caída
+        estadoActual = POSIBLE_CAIDA;
+        tiempoInicioCaida = millis(); // Guardamos el momento exacto
+        Serial.println("\n>>> TRANSICION: NORMAL -> POSIBLE CAIDA LIBRE");
+      }
+      break;
+
+    // ------------------------------------
+    // ESTADO 2: Cayendo, buscando el impacto contra el suelo
+    // ------------------------------------
+    case POSIBLE_CAIDA:
+      // Si el golpe ocurre y supera el umbral de impacto...
+      if (aceleracionTotal > UMBRAL_IMPACTO) {
+        Serial.println("\n>>> IMPACTO CONFIRMADO. TRANSICION -> ALARMA");
+        activarAlarma(false); // Activamos alarma automática
+      } 
+      // Si pasa demasiado tiempo (2 seg) sin impacto, fue una falsa alarma
+      else if (millis() - tiempoInicioCaida > 2000) {
+        estadoActual = NORMAL; // Regresamos al estado inicial
+        Serial.println("\n>>> CAIDA DESCARTADA. TRANSICION -> NORMAL");
+      }
+      break;
+
+    // ------------------------------------
+    // ESTADO 3: Alarma activada, ejecutando sonido e indicadores
+    // ------------------------------------
+    case ALARMA:
+      // Alternar sonido y LED tipo sirena cada 250ms
+      if ((millis() / 250) % 2 == 0) {    
+        tone(BUZZER_PIN, FREC_ALTA);    
+        digitalWrite(LED_PIN, HIGH);
+      } else {    
+        tone(BUZZER_PIN, FREC_BAJA);  
+        digitalWrite(LED_PIN, LOW);
+      }
+
+      // Si transcurre el tiempo límite sin que el usuario cancele...
+      if (millis() - inicioAlarma >= TIEMPO_CONFIRMACION) {
+        // Aquí iría el envío final a la nube (AWS)
+        Serial.println("\n!!! TIEMPO AGOTADO: EMERGENCIA ENVIADA A LA NUBE !!!");
+        cancelarAlarma(); // Reiniciamos el sistema tras confirmar la emergencia
+      }
+      break;
+  }
+}
+
+// =====================================================
+// 7. FUNCIONES AUXILIARES (ACCIONES)
+// Explicación: Funciones que ejecutan acciones específicas y cambian el estado.
+// =====================================================
+
+void activarAlarma(bool manual) {
+  estadoActual = ALARMA;
+  inicioAlarma = millis();
+  alarmaManual = manual;
+  if (manual) {
+    Serial.println("\n*** ALARMA DE PANICO MANUAL ACTIVADA ***");
+  } else {
+    Serial.println("\n*** ALARMA AUTOMATICA POR CAIDA ACTIVADA ***");
+  }
+}
+
+void cancelarAlarma() {
+  noTone(BUZZER_PIN);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW); // Asegurar que el LED se apague
+  estadoActual = NORMAL; // Regreso forzado a reposo
+  alarmaManual = false;
+  Serial.println("\n--- SISTEMA RESTABLECIDO A NORMAL ---");
+}
+
+void manejarBoton() {
+  bool botonAplastado = (digitalRead(BUTTON_PIN) == LOW);
+
+  if (botonAplastado && !botonPresionado) {
+    botonPresionado = true;
+    inicioBoton = millis();
+  }
+
+  if (!botonAplastado && botonPresionado) {
+    botonPresionado = false;
+    unsigned long duracion = millis() - inicioBoton;
+
+    if (duracion < TIEMPO_PULSACION_LARGA) {
+      if (estadoActual == ALARMA) cancelarAlarma();
+    } else {
+      if (estadoActual == NORMAL) activarAlarma(true); // Pánico
+      else if (estadoActual == ALARMA) cancelarAlarma();
+    }
+  }
+}
+
+void atenderComandosBluetooth() {
+  if (SerialBT.available()) {
+    String comando = SerialBT.readStringUntil('\n');
+    comando.trim();
+    if (comando == "CANCELAR" || comando == "APAGAR") {
+      cancelarAlarma();
+    } else if (comando == "ACTIVAR_MANUAL") {
+      activarAlarma(true);
+    }
+  }
+}
+
+// Función que ahora incluye de manera visible la cadena del ESTADO ACTUAL
+void enviarYMostrarDatos(float ax, float ay, float az) {
+  String nombreEstado;
+  
+  // Convertimos el enum a un texto (String) legible para el usuario
+  switch (estadoActual) {
+    case NORMAL: nombreEstado = "NORMAL"; break;
+    case POSIBLE_CAIDA: nombreEstado = "POSIBLE_CAIDA"; break;
+    case ALARMA: nombreEstado = "ALARMA"; break;
+  }
+
+  // Impresión en Monitor Serial incluyendo el ESTADO
+  Serial.print("Est: [");
+  Serial.print(nombreEstado);
+  Serial.print("] | Accel Total: ");
+  Serial.print(aceleracionTotal, 2);
+  Serial.println(" g");
+
+  // Envío a Bluetooth
+  String json = "{\"ax\":" + String(ax, 2) + ",\"ay\":" + String(ay, 2) + 
+                ",\"az\":" + String(az, 2) + ",\"total\":" + String(aceleracionTotal, 2) + 
+                ",\"estado\":\"" + nombreEstado + "\"}";
+  SerialBT.println(json);
+}
