@@ -1,0 +1,345 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// =====================================================
+// CONFIGURACIÓN DE PINES (Uso de const en vez de define)
+// =====================================================
+const int SDA_PIN = 21;
+const int SCL_PIN = 22;
+const int BUZZER_PIN = 25;
+const int BUTTON_PIN = 18;
+const int LED_PIN = 19;        // Pin del LED indicador de alarma
+
+// Frecuencias para la sirena (en Hz)
+const int FREC_ALTA = 3100;
+const int FREC_BAJA = 2300;
+
+// =====================================================
+// OBJETO MPU6050
+// =====================================================
+Adafruit_MPU6050 mpu;
+
+// =====================================================
+// CONFIGURACIÓN DE DETECCIÓN Y TIEMPOS
+// =====================================================
+const float UMBRAL_CAIDA_LIBRE = 0.50;           // g
+const float UMBRAL_IMPACTO = 2.50;               // g
+const unsigned long TIEMPO_CONFIRMACION = 15000; // 15 segundos
+const unsigned long TIEMPO_PULSACION_LARGA = 2000; // 2 segundos
+const unsigned long DEBOUNCE_DELAY = 50;         // Antirrebote de 50 ms
+
+// =====================================================
+// MÁQUINA DE ESTADOS DEL SISTEMA (Enum)
+// =====================================================
+enum EstadoSistema { 
+  NORMAL, 
+  POSIBLE_CAIDA, 
+  ALARMA 
+};
+EstadoSistema estado = NORMAL;
+
+// =====================================================
+// VARIABLES GENERALES
+// =====================================================
+unsigned long inicioAlarma = 0; 
+unsigned long inicioBoton = 0;
+unsigned long ultimoAntiRebote = 0;
+unsigned long tiempoCaida = 0;
+
+bool ultimoEstadoLectura = HIGH;
+bool botonPresionado = false; 
+bool alarmaManual = false;
+float aceleracionTotal = 0.0; 
+bool detectandoCaida = false;
+
+// Prototipos de funciones
+void manejarBoton();
+void maquinaDeEstados();
+void detectarCaida();
+void gestionarAlarma();
+void activarAlarma();
+void activarAlarmaManual();
+void cancelarAlarma();
+
+// =====================================================
+// CONFIGURACIÓN INICIAL (SETUP)
+// =====================================================
+void setup() { 
+  Serial.begin(115200); 
+  delay(1000);
+
+  Serial.println(); 
+  Serial.println("======================================"); 
+  Serial.println("   MONITOR ANTICAIDAS - ESP32"); 
+  Serial.println("======================================");
+
+  // Configuración de pines de hardware
+  pinMode(BUZZER_PIN, OUTPUT); 
+  pinMode(BUTTON_PIN, INPUT_PULLUP);  
+  pinMode(LED_PIN, OUTPUT);
+
+  // Asegurar que los actuadores estén apagados por defecto
+  noTone(BUZZER_PIN); 
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+
+  // Inicializar I2C 
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Inicializar MPU6050 con control defensivo
+  if (!mpu.begin()) { 
+    Serial.println("ERROR: No se encontro el MPU6050."); 
+    while (true) { 
+      tone(BUZZER_PIN, 1000); 
+      digitalWrite(LED_PIN, HIGH);
+      delay(200); 
+      noTone(BUZZER_PIN); 
+      digitalWrite(LED_PIN, LOW);
+      delay(800); 
+    } 
+  }
+
+  Serial.println("MPU6050 encontrado correctamente.");
+
+  // Configuración de rangos del sensor 
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G); 
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG); 
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  Serial.println("Sistema iniciado correctamente."); 
+  Serial.println("\nEstado: NORMAL\n"); 
+}
+
+// =====================================================
+// BUCLE PRINCIPAL (LOOP)
+// =====================================================
+void loop() { 
+  // Lectura del MPU6050 
+  sensors_event_t aceleracion, giro, temperatura;
+  mpu.getEvent(&aceleracion, &giro, &temperatura);
+
+  // Convertir aceleración de m/s^2 a g 
+  float ax = aceleracion.acceleration.x / 9.81; 
+  float ay = aceleracion.acceleration.y / 9.81; 
+  float az = aceleracion.acceleration.z / 9.81;
+
+  // Calcular magnitud total del vector de aceleración 
+  aceleracionTotal = sqrt(ax * ax + ay * ay + az * az);
+
+  // Mostrar lectura e indicador de estado en el monitor serie 
+  Serial.print("Estado: ");
+  if (estado == NORMAL) Serial.print("[NORMAL]");
+  else if (estado == POSIBLE_CAIDA) Serial.print("[POSIBLE_CAIDA]");
+  else if (estado == ALARMA) Serial.print("[ALARMA]");
+
+  Serial.print(" | Aceleracion: X="); 
+  Serial.print(ax, 2); 
+  Serial.print(" g, Y="); 
+  Serial.print(ay, 2); 
+  Serial.print(" g, Z="); 
+  Serial.print(az, 2); 
+  Serial.print(" g | Total: "); 
+  Serial.print(aceleracionTotal, 2); 
+  Serial.println(" g");
+
+  // Gestión de entrada de usuario de forma asíncrona
+  manejarBoton();
+
+  // Ejecución de la máquina de estados centralizada
+  maquinaDeEstados();
+
+  // Pequeño respiro no bloqueante para estabilidad del sistema
+  delay(20); 
+}
+
+// =====================================================
+// MÁQUINA DE ESTADOS (SWITCH - CASE)
+// =====================================================
+void maquinaDeEstados() {
+  switch (estado) {
+    case NORMAL:
+      detectarCaida();
+      break;
+
+    case POSIBLE_CAIDA:
+      detectarCaida(); // Permite seguir evaluando el impacto o la ventana de tiempo sin bloqueos
+      break;
+
+    case ALARMA:
+      gestionarAlarma();
+      break;
+  }
+}
+
+// =====================================================
+// ALGORITMO DE DETECCION DE CAIDAS
+// =====================================================
+void detectarCaida() { 
+  // Condición 1: Caída libre (aceleración cercana a 0g) 
+  if (estado == NORMAL && aceleracionTotal < UMBRAL_CAIDA_LIBRE) { 
+    estado = POSIBLE_CAIDA;
+    detectandoCaida = true;
+    tiempoCaida = millis();
+    Serial.println("\n>>> POSIBLE CAIDA LIBRE DETECTADA"); 
+    return; 
+  }
+
+  // Condición 2: Impacto brusco tras la caída libre 
+  if (estado == POSIBLE_CAIDA && aceleracionTotal > UMBRAL_IMPACTO) { 
+    Serial.println("\n======================================"); 
+    Serial.println("     IMPACTO CONFIRMADO - ALARMA"); 
+    Serial.println("======================================");
+    activarAlarma(); 
+    detectandoCaida = false; 
+    return; 
+  }
+
+  // Cancelar detección si transcurre tiempo sin impacto (Ventana de 2 segundos)
+  if (estado == POSIBLE_CAIDA && (millis() - tiempoCaida > 2000)) { 
+    detectandoCaida = false; 
+    tiempoCaida = 0; 
+    estado = NORMAL;
+    Serial.println("Posible caida descartada. Regresando a NORMAL."); 
+  } 
+}
+
+// =====================================================
+// ACTIVACION DE ALARMAS
+// =====================================================
+void activarAlarma() { 
+  estado = ALARMA; 
+  inicioAlarma = millis(); 
+  alarmaManual = false;
+  digitalWrite(LED_PIN, HIGH);
+
+  Serial.println("\n!!! ALARMA ACTIVADA !!!"); 
+  Serial.println("Pulse el boton para cancelar.\n"); 
+}
+
+void activarAlarmaManual() { 
+  estado = ALARMA; 
+  inicioAlarma = millis(); 
+  alarmaManual = true;
+  digitalWrite(LED_PIN, HIGH);
+
+  Serial.println("\n======================================"); 
+  Serial.println("        ALARMA MANUAL ACTIVADA"); 
+  Serial.println("======================================"); 
+  Serial.println("El usuario solicito ayuda."); 
+  Serial.println("Pulse el boton para cancelar.\n"); 
+}
+
+// =====================================================
+// GESTION Y EMISION DE SONIDO EN ALARMA
+// =====================================================
+void gestionarAlarma() { 
+  // Alternar tono de sirena tipo ambulancia y destello del LED sin usar delay
+  if ((millis() / 250) % 2 == 0) { 
+    tone(BUZZER_PIN, FREC_ALTA);   
+    digitalWrite(LED_PIN, HIGH);
+  } else { 
+    tone(BUZZER_PIN, FREC_BAJA); 
+    digitalWrite(LED_PIN, LOW);
+  }
+
+  unsigned long tiempoTranscurrido = millis() - inicioAlarma; 
+  unsigned long tiempoRestante = TIEMPO_CONFIRMACION - tiempoTranscurrido;
+
+  static unsigned long ultimoMensaje = 0;
+  if (millis() - ultimoMensaje > 1000) { 
+    ultimoMensaje = millis();
+    if (tiempoTranscurrido < TIEMPO_CONFIRMACION) { 
+      Serial.print("ALARMA ACTIVA - "); 
+      Serial.print(tiempoRestante / 1000); 
+      Serial.println(" segundos para confirmar."); 
+    } 
+  }
+
+  // Si se expira el tiempo de confirmación del usuario 
+  if (tiempoTranscurrido >= TIEMPO_CONFIRMACION) { 
+    noTone(BUZZER_PIN); 
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(LED_PIN, LOW);
+
+    Serial.println("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"); 
+    Serial.println("       ALERTA CONFIRMADA"); 
+    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+
+    if (alarmaManual) { 
+      Serial.println("Tipo: ALARMA MANUAL"); 
+    } else { 
+      Serial.println("Tipo: POSIBLE CAIDA"); 
+    }
+
+    Serial.println("Enviando alerta a centrales de emergencia / MQTT...\n");
+
+    estado = NORMAL; 
+    alarmaManual = false; 
+  } 
+}
+
+// =====================================================
+// MANEJO DEL BOTON CON ANTIRREBOTE Y DOBLE FUNCIÓN
+// =====================================================
+void manejarBoton() { 
+  int lecturaActual = digitalRead(BUTTON_PIN);
+
+  // Si el estado del botón cambió por ruido o pulsación real
+  if (lecturaActual != ultimoEstadoLectura) {
+    ultimoAntiRebote = millis();
+  }
+
+  // Si la lectura se mantiene estable superando el tiempo de rebote
+  if ((millis() - ultimoAntiRebote) > DEBOUNCE_DELAY) {
+    bool lecturaEstable = (lecturaActual == LOW); // LOW significa presionado (Pull-Up)
+
+    if (lecturaEstable && !botonPresionado) {
+      botonPresionado = true;
+      inicioBoton = millis();
+    }
+
+    if (!lecturaEstable && botonPresionado) {
+      botonPresionado = false;
+      unsigned long duracion = millis() - inicioBoton;
+
+      // Pulsación corta: Cancelar Alarma si está activa
+      if (duracion < TIEMPO_PULSACION_LARGA) {
+        if (estado == ALARMA || estado == POSIBLE_CAIDA) { 
+          cancelarAlarma(); 
+        } else { 
+          Serial.println("\nBoton presionado.\nNo hay alarma activa que cancelar."); 
+        } 
+      } 
+      // Pulsación larga: Activar Alarma Manual o cancelar
+      else { 
+        if (estado == NORMAL) { 
+          activarAlarmaManual(); 
+        } else if (estado == ALARMA || estado == POSIBLE_CAIDA) { 
+          cancelarAlarma(); 
+        } 
+      } 
+    }
+  }
+
+  ultimoEstadoLectura = lecturaActual;
+}
+
+// =====================================================
+// CANCELAR Y SILENCIAR ALARMA
+// =====================================================
+void cancelarAlarma() { 
+  noTone(BUZZER_PIN); 
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+
+  Serial.println("\n--------------------------------------"); 
+  Serial.println("        ALARMA CANCELADA"); 
+  Serial.println("--------------------------------------"); 
+  Serial.println("El usuario indico que esta bien.\n");
+
+  estado = NORMAL; 
+  alarmaManual = false; 
+  inicioAlarma = 0; 
+  detectandoCaida = false;
+}
