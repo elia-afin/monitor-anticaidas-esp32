@@ -1,0 +1,342 @@
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ArduinoJson.h>      
+#include <PubSubClient.h>     
+#include "config.h"           // Tus credenciales WiFi y MQTT
+
+// --- OBJETOS DE CONEXIÓN MQTT ---
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+
+String topicEstado = String(TOPIC) + "/estado";
+String topicCmd = String(TOPIC) + "/cmd";
+
+// --- 1. CONFIGURACIÓN SEGURA DE PINES (Uso de const) ---
+const int SDA_PIN = 21;
+const int SCL_PIN = 22;
+const int BUZZER_PIN = 25;
+const int BUTTON_PIN = 18;
+const int LED_PIN = 19;        
+
+const int FREC_ALTA = 3100;    
+const int FREC_BAJA = 2300;    
+
+// --- CONFIGURACIÓN DE PANTALLA OLED ---
+const int SCREEN_WIDTH = 128;
+const int SCREEN_HEIGHT = 64;
+const int OLED_RESET = -1;           
+const uint8_t SCREEN_ADDRESS = 0x3C; 
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_MPU6050 mpu;
+
+// --- 2. UMBRALES FÍSICOS Y TEMPORIZADORES ---
+const float UMBRAL_CAIDA_LIBRE = 0.50;           // Ingravidez (g)
+const float UMBRAL_IMPACTO = 2.50;               // Choque (g)
+const unsigned long TIEMPO_CONFIRMACION = 15000; // 15s tolerancia
+const unsigned long TIEMPO_PULSACION_LARGA = 2000; // 2s para pánico con botón
+const unsigned long DEBOUNCE_DELAY = 50;         // Antirrebote de 50ms
+const unsigned long ESPERA_RECONEX_MQTT = 5000;  // 5s para intentar reconexión MQTT
+
+// --- 3. MÁQUINA DE ESTADOS (INTACTA) ---
+enum EstadoSistema { NORMAL, POSIBLE_CAIDA, ALARMA };
+EstadoSistema estado = NORMAL;
+
+// Variables de control asíncrono
+unsigned long inicioAlarma = 0;
+unsigned long inicioBoton = 0;
+unsigned long ultimoEnvio = 0;
+unsigned long ultimoAntiRebote = 0;
+unsigned long tiempoInicioCaida = 0; 
+unsigned long t_reconex_mqtt = 0;
+
+bool ultimoEstadoLectura = HIGH;
+bool botonPresionado = false;
+bool alarmaManual = false;
+float aceleracionTotal = 0.0;
+float ax = 0, ay = 0, az = 0; 
+
+// Prototipos funcionales
+void maquinaDeEstados();
+void manejarBoton();
+void activarAlarma(bool manual);
+void cancelarAlarma();
+void enviarYMostrarDatos();
+void actualizarOLED(String estadoStr);
+void reconnectMQTT();
+void callbackMQTT(char* topic, byte* payload, unsigned int length);
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP); // Resistencia interna
+  pinMode(LED_PIN, OUTPUT);
+
+  noTone(BUZZER_PIN);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Inicialización de pantalla OLED
+  if (display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 20);
+    display.println("Iniciando...");
+    display.display();
+  }
+
+  // Inicialización defensiva de MPU6050
+  if (!mpu.begin()) {
+    while (true) {
+      tone(BUZZER_PIN, 1000); digitalWrite(LED_PIN, HIGH); delay(200);
+      noTone(BUZZER_PIN); digitalWrite(LED_PIN, LOW); delay(800);
+    }
+  }
+
+  // Filtros contra ruido mecánico
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  // Conexión WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  display.clearDisplay();
+  display.setCursor(0, 10);
+  display.print("Conectando WiFi...");
+  display.display();
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Conectado!");
+
+  // Configuración MQTT
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(callbackMQTT);
+}
+
+void loop() {
+  // 1. Gestión de red (No bloqueante)
+  reconnectMQTT();
+  mqtt.loop();
+
+  // 2. Adquisición de datos
+  sensors_event_t aceleracion, giro, temperatura;
+  mpu.getEvent(&aceleracion, &giro, &temperatura);
+
+  ax = aceleracion.acceleration.x / 9.81;
+  ay = aceleracion.acceleration.y / 9.81;
+  az = aceleracion.acceleration.z / 9.81;
+  aceleracionTotal = sqrt(ax * ax + ay * ay + az * az);
+
+  // 3. Evaluar Botón físico
+  manejarBoton();
+
+  // 4. Ejecución de la Máquina de Estados Finitos (FSM)
+  maquinaDeEstados();
+
+  // 5. Envío al Grafo Serial, MQTT y OLED (cada 100ms)
+  if (millis() - ultimoEnvio > 100) { 
+    ultimoEnvio = millis();
+    enviarYMostrarDatos();
+  }
+
+  delay(10);
+}
+
+// --- 4. NÚCLEO LÓGICO: MÁQUINA DE ESTADOS (INTACTA) ---
+void maquinaDeEstados() {
+  switch (estado) {
+    case NORMAL:
+      if (aceleracionTotal < UMBRAL_CAIDA_LIBRE) {
+        estado = POSIBLE_CAIDA;
+        tiempoInicioCaida = millis(); 
+      }
+      break;
+
+    case POSIBLE_CAIDA:
+      if (aceleracionTotal > UMBRAL_IMPACTO) {
+        activarAlarma(false); 
+      } 
+      else if (millis() - tiempoInicioCaida > 2000) {
+        estado = NORMAL; 
+      }
+      break;
+
+    case ALARMA:
+      if ((millis() / 250) % 2 == 0) {
+        tone(BUZZER_PIN, FREC_ALTA);
+        digitalWrite(LED_PIN, HIGH);
+      } else {
+        tone(BUZZER_PIN, FREC_BAJA);
+        digitalWrite(LED_PIN, LOW); 
+      }
+
+      if (millis() - inicioAlarma >= TIEMPO_CONFIRMACION) {
+        cancelarAlarma(); 
+      }
+      break;
+  }
+}
+
+// --- 5. RUTINAS DE ACCIÓN Y CONTROL ---
+
+void activarAlarma(bool manual) {
+  estado = ALARMA;
+  inicioAlarma = millis();
+  alarmaManual = manual;
+  digitalWrite(LED_PIN, HIGH);
+}
+
+void cancelarAlarma() {
+  noTone(BUZZER_PIN);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+  estado = NORMAL; 
+  alarmaManual = false;
+  inicioAlarma = 0;
+}
+
+// Botón defensivo con Antirrebote (Debounce) - Activa alarma manualmente con pulsación larga
+void manejarBoton() {
+  int lecturaActual = digitalRead(BUTTON_PIN);
+  if (lecturaActual != ultimoEstadoLectura) ultimoAntiRebote = millis();
+
+  if ((millis() - ultimoAntiRebote) > DEBOUNCE_DELAY) {
+    bool lecturaEstable = (lecturaActual == LOW); 
+
+    if (lecturaEstable && !botonPresionado) {
+      botonPresionado = true;
+      inicioBoton = millis();
+    }
+
+    if (!lecturaEstable && botonPresionado) {
+      botonPresionado = false;
+      unsigned long duracion = millis() - inicioBoton;
+
+      if (duracion < TIEMPO_PULSACION_LARGA) {
+        // Pulsación Corta: Cancela si hay alarma
+        if (estado == ALARMA) cancelarAlarma();
+      } else {
+        // Pulsación Larga: Activa Alarma manual (Pánico)
+        if (estado == NORMAL || estado == POSIBLE_CAIDA) activarAlarma(true);
+        else if (estado == ALARMA) cancelarAlarma();
+      }
+    }
+  }
+  ultimoEstadoLectura = lecturaActual;
+}
+
+// --- COMUNICACIÓN MQTT NO BLOQUEANTE ---
+void reconnectMQTT() {
+  if (mqtt.connected()) return;
+  
+  unsigned long ahora = millis();
+  if (ahora - t_reconex_mqtt < ESPERA_RECONEX_MQTT) return; 
+  
+  t_reconex_mqtt = ahora;
+  
+  if (mqtt.connect(MQTT_USER, MQTT_USER, MQTT_PASS)) {
+    mqtt.subscribe(topicCmd.c_str()); 
+    Serial.println("Reconectado a MQTT");
+  }
+}
+
+void callbackMQTT(char* topic, byte* payload, unsigned int length) {
+  String mensaje = "";
+  for (int i = 0; i < length; i++) {
+    mensaje += (char)payload[i];
+  }
+  mensaje.trim();
+  
+  if (String(topic) == topicCmd) {
+    if (mensaje == "CANCELAR" || mensaje == "APAGAR") cancelarAlarma();
+    else if (mensaje == "ACTIVAR_MANUAL") activarAlarma(true);
+  }
+}
+
+// --- 6. GRAFICADOR Y PANTALLA ---
+void enviarYMostrarDatos() {
+  String estStr;
+  int estadoPlotter; 
+  int estadoMqtt; 
+
+  switch (estado) {
+    case NORMAL: estStr = "NORMAL"; estadoPlotter = 1; estadoMqtt = 0; break;
+    case POSIBLE_CAIDA: estStr = "CAYENDO"; estadoPlotter = 2; estadoMqtt = 1; break;
+    case ALARMA: estStr = "ALARMA"; estadoPlotter =  3; estadoMqtt = 2; break;
+  }
+
+  // Envío de datos a MQTT (si está conectado)
+  if (mqtt.connected()) {
+    JsonDocument doc; 
+    doc["ax"] = ax;
+    doc["ay"] = ay;
+    doc["az"] = az;
+    doc["aceleracion_total"] = aceleracionTotal;
+    doc["estado"] = estadoMqtt; 
+
+    char buf[256];
+    serializeJson(doc, buf);
+    mqtt.publish(TOPIC, (uint8_t*)buf, strlen(buf), true); 
+  }
+
+  // Envío de datos al Grafo (Serial Plotter)
+  Serial.print("EjeX:"); Serial.print(ax, 2); Serial.print(",");
+  Serial.print("EjeY:"); Serial.print(ay, 2); Serial.print(",");
+  Serial.print("EjeZ:"); Serial.print(az, 2); Serial.print(",");
+  Serial.print("TotalG:"); Serial.print(aceleracionTotal, 2); Serial.print(",");
+  Serial.print("Modo:"); Serial.println(estadoPlotter); 
+
+  actualizarOLED(estStr);
+}
+
+void actualizarOLED(String estadoStr) {
+  display.clearDisplay();
+  
+  // --- BARRA SUPERIOR DE ESTADO ---
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("MONITOR");
+  
+  // Mostrar estado WiFi
+  if(WiFi.status() == WL_CONNECTED){
+      display.setCursor(65, 0);
+      display.print("WiFi:OK");
+  } else {
+      display.setCursor(65, 0);
+      display.print("WiFi:NO");
+  }
+
+  // Indicador pequeño de MQTT si está activo
+  if(mqtt.connected()){
+      display.setCursor(110, 0);
+      display.print(" MQ");
+  }
+
+  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+
+  // --- ESTADO PRINCIPAL (FSM) ---
+  display.setTextSize(2);
+  display.setCursor(0, 20);
+  display.print(estadoStr); 
+
+  // --- ACELERACIÓN ---
+  display.setTextSize(1);
+  display.setCursor(0, 48);
+  display.print("Acel: ");
+  display.print(aceleracionTotal, 2);
+  display.print(" g");
+  
+  display.display();
+}
